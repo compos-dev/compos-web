@@ -118,7 +118,7 @@
           (string-append
             "xsltproc --html "
             (web--shell-quote
-              (string-append (aimax-priv-dir) "/packages/web/parsers/" sheet))
+              (string-append (compos-priv-dir) "/packages/web/parsers/" sheet))
             " ")
           (string-append "readable --base " (web--shell-quote url) " "))
       (web--shell-quote file) " 2>/dev/null" *web--pandoc*)))
@@ -147,7 +147,7 @@
 
 (define (web--write-html! html)
   (set! *web--read-seq* (+ *web--read-seq* 1))
-  (let ((file (string-append (aimax-home) "/browse-fetch-"
+  (let ((file (string-append (compos-home) "/browse-fetch-"
                              (number->string *web--read-seq*) ".html")))
     (write-file! file html)
     file))
@@ -191,7 +191,7 @@
 ;; 304 with no body — headers only — and the caller serves its copy.
 (define (web--curl-html url k revalidate?)
   (let ((u (web--shell-quote url))
-        (dir (web--shell-quote (string-append (aimax-home) "/web-etags"))))
+        (dir (web--shell-quote (string-append (compos-home) "/web-etags"))))
     (shell-command->string
       (string-append
         "mkdir -p " dir "; "
@@ -264,7 +264,7 @@
 ;;; first. The browse prompt completes over them, and the title matches
 ;;; what you type.
 
-(define *web-visited-file* (string-append (aimax-home) "/web-visited"))
+(define *web-visited-file* (string-append (compos-home) "/web-visited"))
 (define *web-visited-max* 200)
 
 (define (web--visited)
@@ -572,7 +572,7 @@
   (overlay-set! buf 'web-meta
     (web--meta-ranges (buffer-text buf))))
 
-(define *web--article-separator* "AIMAX-ARTICLE-SEPARATOR")
+(define *web--article-separator* "COMPOS-ARTICLE-SEPARATOR")
 
 (define (web--article-separator-ranges text)
   (let loop ((lines (string-split text "\n"))

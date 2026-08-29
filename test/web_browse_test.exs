@@ -1,4 +1,4 @@
-defmodule Aimax.WebBrowseTest do
+defmodule Compos.WebBrowseTest do
   @moduledoc """
   packages/web.scm — the parts Scheme cannot hold.
 
@@ -12,7 +12,7 @@ defmodule Aimax.WebBrowseTest do
 
   use ExUnit.Case, async: false
 
-  alias Aimax.Core.{Buffer, Editor, KeyDispatch, Session}
+  alias Compos.Core.{Buffer, Editor, KeyDispatch, Session}
 
   defp eval!(source) do
     {:ok, printed} = Session.eval(source)
@@ -190,7 +190,7 @@ defmodule Aimax.WebBrowseTest do
       )
 
     assert md =~
-             "![](https://substackcdn.com/image/fetch/avatar.jpeg#aimax-avatar) [Alice](/@alice) · [Aug 3](/@alice/note/c-1) ♥ 34 💬 2 ↻ 3"
+             "![](https://substackcdn.com/image/fetch/avatar.jpeg#compos-avatar) [Alice](/@alice) · [Aug 3](/@alice/note/c-1) ♥ 34 💬 2 ↻ 3"
 
     refute md =~ "Aug 3, 2026"
     assert eval!(~S{(web--date-link? (list 0 5 "/@alice/note/c-1"))}) == "#t"
@@ -200,20 +200,20 @@ defmodule Aimax.WebBrowseTest do
     assert md =~ "[Clickable article title](https://alice.example/p/clickable-post)"
 
     assert md =~
-             ~S|\n\n![](https://substackcdn.com/image/fetch/w_20,h_20/publication.png#aimax-avatar) Alice publication\n\n|
+             ~S|\n\n![](https://substackcdn.com/image/fetch/w_20,h_20/publication.png#compos-avatar) Alice publication\n\n|
 
     assert md =~ "Alice publication"
 
     assert eval!(~S{(web--parse *zz-substack-md*)}) =~
              "https://alice.example/p/clickable-post"
 
-    assert length(Regex.scan(~r/AIMAX-ARTICLE-SEPARATOR/, md)) == 1
+    assert length(Regex.scan(~r/COMPOS-ARTICLE-SEPARATOR/, md)) == 1
 
-    assert eval!(~S{(web--article-separator-ranges "a\nAIMAX-ARTICLE-SEPARATOR\nb")}) ==
-             ~S[((2 25 "web-separator"))]
+    assert eval!(~S{(web--article-separator-ranges "a\nCOMPOS-ARTICLE-SEPARATOR\nb")}) ==
+             ~S[((2 26 "web-separator"))]
 
     assert md =~ "https://substackcdn.com/image/fetch/content-image.png"
-    assert md =~ "![](https://substackcdn.com/image/fetch/avatar.jpeg#aimax-avatar)"
+    assert md =~ "![](https://substackcdn.com/image/fetch/avatar.jpeg#compos-avatar)"
     refute md =~ "Alice avatar"
     assert md =~ "♥ 34"
     assert md =~ "💬 2"

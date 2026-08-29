@@ -31,9 +31,9 @@
 
     <xsl:copy>
       <xsl:copy-of select="@*"/>
-      <div class="aimax-substack-header">
+      <div class="compos-substack-header">
         <xsl:if test="$avatar">
-          <img src="{concat($avatar/@src, '#aimax-avatar')}" alt=""/>
+          <img src="{concat($avatar/@src, '#compos-avatar')}" alt=""/>
           <xsl:text> </xsl:text>
         </xsl:if>
         <xsl:if test="$author">
@@ -69,7 +69,7 @@
       </xsl:apply-templates>
     </xsl:copy>
     <xsl:if test="position() != last()">
-      <div class="aimax-article-separator">AIMAX-ARTICLE-SEPARATOR</div>
+      <div class="compos-article-separator">COMPOS-ARTICLE-SEPARATOR</div>
     </xsl:if>
   </xsl:template>
 
@@ -98,7 +98,7 @@
       <xsl:with-param name="avatar-src" select="$avatar-src"/>
     </xsl:apply-templates>
     <xsl:if test="$card-title">
-      <div class="aimax-substack-article-link">
+      <div class="compos-substack-article-link">
         <a href="{@href}">
           <xsl:value-of select="normalize-space($card-title)"/>
         </a>
@@ -138,10 +138,10 @@
     mode="copy">
     <xsl:param name="avatar-src"/>
     <xsl:if test="not(@src=$avatar-src)">
-      <div class="aimax-substack-publication">
-        <img src="{concat(@src, '#aimax-avatar')}" alt=""/>
+      <div class="compos-substack-publication">
+        <img src="{concat(@src, '#compos-avatar')}" alt=""/>
         <xsl:text> </xsl:text>
-        <span class="aimax-substack-publication-name">
+        <span class="compos-substack-publication-name">
           <xsl:value-of select="normalize-space(@alt)"/>
         </span>
       </div>
