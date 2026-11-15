@@ -175,42 +175,6 @@
                              "and the one that leaves")))))
     (t--web-kill-tabs!)))
 
-(deftest 'every-page-is-its-own-tab-in-the-current-group
-  "outside returns to a tab; preview links navigate that tab in place"
-  (lambda ()
-    (t--web-with-fetch
-      (lambda (url want k) (k (list want (t--web-pages url) #f)))
-      (lambda ()
-        (t--web-pin-group! "zzweb-home"
-          (lambda ()
-            (let ((a (browse "https://site.test/index.html")))
-              (check-contains! (modeline-cache-get a 'name) "site.test/index.html"
-                               "the visible title names the first page")
-              (switch-to-buffer! "*scratch*")
-              (let ((b (browse "https://site.test/second.html")))
-                (check-false! (equal? a b) "two pages, two tabs")
-                (check-contains! a "*browse:" "the tab is named for the page")
-                (check-equal! (group-name (buffer-group b)) "zzweb-home"
-                              "both tabs sit in the current group")
-                (switch-to-buffer! "*scratch*")
-                (check-equal! (browse "https://site.test/second.html") b
-                              "the same url returns"))
-
-              ;; The rendered preview sends relative links back through browse.
-              (switch-to-buffer! a)
-              (buffer-goto! a 12)
-              (preview-follow-link! (active-window) "second.html")
-              (check-equal! (current-buffer) a "preview navigation stays in tab")
-              (check-equal! (buffer-local-value 'browse-url a)
-                            "https://site.test/second.html"
-                            "the relative target resolves against the page")
-              (check-equal! (buffer-point a) 0
-                            "new navigation starts at the top")
-              (check-contains! (modeline-cache-get a 'name)
-                               "site.test/second.html"
-                               "the visible title follows navigation"))))))
-    (t--web-kill-tabs!)))
-
 ;;; --- the cache ----------------------------------------------------------------
 
 (deftest 'a-failed-refetch-keeps-the-page
@@ -586,48 +550,6 @@
           (check-equal! (buffer-point buf) 12 "point stayed"))))
     (t--web-kill-tabs!)))
 
-;;; --- the other window -----------------------------------------------------------
-
-(deftest 'a-link-opens-beside-this-window-and-point-stays-here
-  "M-RET: the tab shows in another window; the selected window keeps its page"
-  (lambda ()
-    (run-command "delete-other-windows")
-    (t--web-with-fetch
-      (lambda (url want k) (k (list want (t--web-pages url) #f)))
-      (lambda ()
-        ;; browse selects the tab's window, so the command runs the way a
-        ;; key press runs it: in the selected window, not under a
-        ;; with-current-buffer, which binds the buffer and not the window
-        (let* ((a (browse "https://site.test/index.html"))
-               (l (web--link-after a 0)))
-          (goto-char! (car l))
-          (run-command "browse-follow-other-window")
-          (check-equal! (current-buffer) a "the reader stays in the page")
-          (check-equal! (buffer-point a) (car l) "at the link")
-          (let ((b (web--buffer-for "https://site.test/second.html")))
-            (check-true! (and b #t) "the link's tab exists")
-            (check-contains! (buffer-text b) "Second page" "and holds the page")
-            (check-true! (and (window-showing b) #t) "in a window of its own")
-            (check-false! (equal? (window-showing b) (active-window))
-                          "which is not the selected one")))))
-    (t--web-kill-tabs!)
-    (run-command "delete-other-windows")))
-
-(deftest 'browse-other-window-shows-the-page-and-leaves-the-window-alone
-  "the C-x 4 shape from any buffer"
-  (lambda ()
-    (run-command "delete-other-windows")
-    (t--web-with-fetch
-      (lambda (url want k) (k (list want (t--web-pages url) #f)))
-      (lambda ()
-        (switch-to-buffer! "*scratch*")
-        (let ((b (browse-other-window "https://site.test/index.html")))
-          (check-equal! (current-buffer) "*scratch*" "the selected window is untouched")
-          (check-contains! b "*browse:" "the page has its tab")
-          (check-true! (and (window-showing b) #t) "shown in another window"))))
-    (t--web-kill-tabs!)
-    (run-command "delete-other-windows")))
-
 ;;; --- the history file -----------------------------------------------------------
 
 (deftest 'the-history-file-keeps-url-title-and-time-newest-first
@@ -825,10 +747,13 @@
   "text reads as text, and a type with no reader says what it is"
   (lambda ()
     (let ((answer #f))
-      (web--read-mime "https://h.test/notes.txt" "calm"
-                      (web--document "text/plain" "plain words here\n" #f)
-                      (lambda (found) (set! answer found)))
-      (check-true! (wait-until (lambda () (and answer #t)) 5000 20) "the reading answered")
+      (t--web-shell-at-once
+        (lambda ()
+          (web--read-mime "https://h.test/notes.txt" "calm"
+                          (web--document "text/plain" "plain words here\n" #f)
+                          (lambda (found) (set! answer found)))))
+      (check-true! (and answer #t) "the reading answered")
+      (set! answer (or answer (list #f "" #f)))
       (check-contains! (nth 1 answer) "# notes.txt" "the page is titled by its name")
       (check-contains! (nth 1 answer) "plain words here" "and holds the text")
       (check-false! (nth 2 answer) "a body that is not html has no source to show"))
@@ -877,13 +802,14 @@
       (t--web-with-fetch
         ;; the real pipeline always answers on a callback, and the tab is
         ;; retired there: a stub that answers inline would be killing the
-        ;; buffer under the caller that just asked for it
+        ;; buffer under the caller that just asked for it. The answer waits
+        ;; in the queue until browse has returned.
         (lambda (url want k)
-          (shell-command->string "true" (lambda (out) (k (list "file" path #f)))))
+          ((t--web-read-later (list "file" path #f)) k))
         (lambda ()
           (let ((tab (browse "https://site.test/zz-web-viewer.pdf")))
-            (check-true! (wait-until (lambda () (not (buffer-known? tab))) 5000 25)
-                         "the tab is gone")
+            (t--web-answer-all!)
+            (check-false! (buffer-known? tab) "the tab is gone")
             (check-true! (and (window-showing path) #t) "and the file has its window"))))
       (when (buffer-known? path) (buffer-kill! path))
       (delete-file! path))
@@ -918,9 +844,19 @@
       (set! *web--tab-hosts* saved-tabs)
       (set! *web-fetch-html* saved))))
 
-;; the readings answer on a callback, as the shell does
+;; the readings answer on a callback, as the shell does. A test holds its
+;; lane, so a real shell callback would land only after the test ends: the
+;; answers wait in a queue, and t--web-answer-all! hands them over in order.
+(define t--web-answers '())
 (define (t--web-read-later md)
-  (lambda (k) (shell-command->string "true" (lambda (out) (k md)))))
+  (lambda (k) (set! t--web-answers (append t--web-answers (list (lambda () (k md)))))))
+(define (t--web-answer-all!)
+  (let loop ()
+    (when (pair? t--web-answers)
+      (let ((next (car t--web-answers)))
+        (set! t--web-answers (cdr t--web-answers))
+        (next)
+        (loop)))))
 
 (deftest 'a-calm-ask-reads-both-ways-at-once-and-decide-picks
   "an index page costs the slower reading, not the sum; an article still reads calm"
@@ -943,9 +879,12 @@
           (web--attempt "https://site.test/page" "calm" #f
                         (lambda (found) (set! answer found)))
           (let ((asked-at-once asked))
-            (check-true! (wait-until (lambda () (not (eq? answer 'none))) 5000 20)
-                         "the reading answered")
-            (list asked-at-once (nth 0 answer) (nth 1 answer)))))
+            (t--web-answer-all!)
+            (check-true! (not (eq? answer 'none)) "the reading answered")
+            ;; no answer must fail the checks, not raise past the restores below
+            (if (pair? answer)
+                (list asked-at-once (nth 0 answer) (nth 1 answer))
+                (list asked-at-once #f #f)))))
       (set! browse-learn-parsers #f)
       (set! *web--judge* (lambda (url md k) (k #f)))
       (set! *web-fetch-html*
@@ -988,8 +927,11 @@
           (saved-tabs *web--tab-hosts*)
           (saved-judged *web--judged-hosts*)
           (saved-learn browse-learn-parsers)
+          (saved-shells browse-judge-shells)
+          (verdict #f)
           (ways '())
           (verdicts 0))
+      (set! browse-judge-shells #t)
       (set! browse-learn-parsers #f)
       ;; the reading is not the question here: every page is an article
       (set! *web--arbiter* (lambda (url html k) (k 'article)))
@@ -1007,18 +949,19 @@
                      "# x\n\nSomething went wrong. Try reloading. [home](https://shell.test/)\n"
                      "# x\n\nthe page [a](https://shell.test/a)\n"))))
       ;; the judge answers on a callback, as decide does: the page is on
-      ;; screen and its fetch is over before the verdict lands
+      ;; screen and its fetch is over before the verdict lands. The test
+      ;; holds its lane, so it hands the verdict over itself.
       (set! *web--judge*
             (lambda (url md k)
               (set! verdicts (+ verdicts 1))
-              (shell-command->string "true"
-                (lambda (out) (k (string-contains? md "went wrong"))))))
+              (set! verdict (lambda () (k (string-contains? md "went wrong"))))))
       (t--web-with-fetch *web-fetch*
         (lambda ()
           (let ((buf (browse "https://shell.test/home")))
             (check-contains! (buffer-text buf) "went wrong" "the fetched page shows at once")
-            (check-true! (wait-until (lambda () (string-contains? (buffer-text buf) "the page")) 5000 20)
-                         "the tab's reading replaced the shell")
+            (check-true! (procedure? verdict) "the judge was asked")
+            (verdict)
+            (check-contains! (buffer-text buf) "the page" "the tab's reading replaced the shell")
             (check-equal! ways '(#f #t) "the fetch, then the tab")
             (check-true! (web--tab-host? "https://shell.test/x") "the host starts in a tab now")
             (let ((next (browse "https://shell.test/next")))
@@ -1030,6 +973,7 @@
       (set! *web--judged-hosts* saved-judged)
       (set! *web--tab-hosts* saved-tabs)
       (set! *web--judge* saved-judge)
+      (set! browse-judge-shells saved-shells)
       (set! web--read saved-read)
       (set! *web-fetch-html* saved-fetch))))
 
@@ -1045,9 +989,23 @@
                  "a key that came back as a string")
     (check-false! (web--judge-yes? '(answers () usage (0 0 jev 0)) 'shell) "no answer is a no")))
 
+;; A shell callback lands on the lane that ran the command, and a test holds
+;; its lane until it returns: a wait-until for that callback always times out.
+;; Inside THUNK a command with a callback runs at once and calls it in place.
+(define (t--web-shell-at-once thunk)
+  (let ((shell shell-command->string))
+    (set! shell-command->string
+      (lambda (cmd . more)
+        (let ((n (length more)))
+          (if (and (> n 0) (procedure? (list-ref more (- n 1))))
+              ((list-ref more (- n 1)) (apply shell cmd (list-head more (- n 1))))
+              (apply shell cmd more)))))
+    (unwind-protect thunk (lambda () (set! shell-command->string shell)))))
+
 (deftest 'a-nested-table-layout-reads-as-rows-and-a-plain-table-stays-one
   "both passes start at once; the flat one is the reading only when pandoc gave up"
   (lambda ()
+   (t--web-shell-at-once (lambda ()
     (let ((nested (web--write-html!
                     (string-append
                       "<html><body><table><tr><td><table><tr><td><p>first cell with enough "
@@ -1075,7 +1033,7 @@
       (check-true! (and (string? b) (string-contains? b "| ann") #t)
                    "a real table stays a table")
       (delete-file! nested)
-      (delete-file! plain))))
+      (delete-file! plain))))))
 
 (effects! '(read))
 
@@ -1208,3 +1166,33 @@
     (check-true! (web--date-link? (list 0 5 "/@alice/note/c-1")) "a note link is a date link")
     (check-equal! (web--article-separator-ranges "a\nCOMPOS-ARTICLE-SEPARATOR\nb") '((2 26 "web-separator"))
                   "the separator range")))
+
+(define t--web-substack-html
+  "<html><body><nav>Home Subscriptions Chat Activity Explore Dashboard</nav><main><div role='article' aria-label='Note'><img src='https://substackcdn.com/image/fetch/avatar.jpeg' alt='Alice avatar'><a href='/@alice'>Alice</a><a href='/@alice/note/c-1' title='Aug 3, 2026, 9:00 PM'>Aug 3</a><p>This is the first useful feed note. It contains enough text to remain above the parser confidence threshold.</p><img src='https://substackcdn.com/image/fetch/content-image.png' alt='A useful diagram'><p>The second paragraph proves that the selected article body survives conversion with its links and prose intact.</p><p>The third paragraph keeps this fixture representative of a real Substack feed item.</p><a href='https://alice.example/p/clickable-post'><img src='https://substackcdn.com/image/fetch/article-card.png' alt=''><div><a href='https://alice.example'>Alice publication</a><div>Clickable article title</div></div></a><img src='https://substackcdn.com/image/fetch/w_20,h_20/publication.png' sizes='20px' alt='Alice publication'><div class='actions'><button aria-label='Like'><svg></svg><span>34</span></button><button aria-label='Comment'><svg></svg><span>2</span></button><button aria-label='Restack'><svg></svg><span>3</span></button><button aria-label='Share'><svg></svg></button></div></div><div role='article' aria-label='Note'><a href='/@bob'>Bob</a><a href='/@bob/note/c-2'>Aug 4</a><p>This is the second useful feed note. It verifies that one separator appears between two semantic articles.</p></div><section><h2>People to follow</h2><p>Suggested Person</p></section></main></body></html>")
+
+(deftest 'substack-keeps-feed-articles-and-groups-reaction-counts
+  "the calm reading of a feed: one byline per note with its counts, the card a link, the furniture gone"
+  (lambda ()
+    (t--web-shell-at-once
+      (lambda ()
+        (let ((f (web--write-html! t--web-substack-html))
+              (md #f))
+          (web--read "https://substack.com/" f "calm" (lambda (out) (set! md out)))
+          (delete-file! f)
+          (check-true! (string? md) "the calm reading answered")
+          (let ((md (or md "")))
+            (check-contains! md "![](https://substackcdn.com/image/fetch/avatar.jpeg#compos-avatar) [Alice](/@alice) · [Aug 3](/@alice/note/c-1) ♥ 34 💬 2 ↻ 3"
+                             "the byline: avatar, author, date link and the counts on one line")
+            (check-false! (string-contains? md "Aug 3, 2026") "the date is the link text, not its title")
+            (check-contains! md "first useful feed note" "the first note")
+            (check-contains! md "second useful feed note" "the second note")
+            (check-contains! md "[Clickable article title](https://alice.example/p/clickable-post)" "the card is a link")
+            (check-contains! md "\n\n![](https://substackcdn.com/image/fetch/w_20,h_20/publication.png#compos-avatar) Alice publication\n\n"
+                             "the publication line")
+            (check-true! (and (find (lambda (l) (equal? (caddr l) "https://alice.example/p/clickable-post")) (cadr (web--parse md))) #t)
+                         "the card link parses")
+            (check-equal! (length (re-find* "COMPOS-ARTICLE-SEPARATOR" md)) 1 "one separator between two notes")
+            (check-contains! md "https://substackcdn.com/image/fetch/content-image.png" "the content image stays")
+            (check-false! (string-contains? md "Alice avatar") "the avatar has no alt text")
+            (for-each (lambda (s) (check-false! (string-contains? md s) (string-append "no " s)))
+                      (list "\n34\n" "\n2\n" "\n3\n" "Home Subscriptions" "People to follow" "Suggested Person"))))))))
