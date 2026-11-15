@@ -129,10 +129,14 @@
 ;; A bundled parser is a bare file name under web/parsers. A user package
 ;; keeps its stylesheet beside its own source, so an absolute path is taken
 ;; as written -- that is what lets a site parser live outside this tree.
+;; A learned sheet is the reader's data, not code: it lives in
+;; <compos-home>/web/parsers, and a bare name looks there first.
+(define (web--parsers-dir) (string-append (package-data-dir 'web) "/parsers/"))
+
 (define (web--parser-path sheet)
-  (if (string-prefix? "/" sheet)
-      sheet
-      (locate-library (string-append "web/parsers/" sheet))))
+  (cond ((string-prefix? "/" sheet) sheet)
+        ((file-exists? (string-append (web--parsers-dir) sheet)) (string-append (web--parsers-dir) sheet))
+        (else (locate-library (string-append "web/parsers/" sheet)))))
 
 ;; The one door a user package registers through: same triple as
 ;; *web--sites*, replacing any earlier entry for the same base.
@@ -168,9 +172,9 @@
 
 (define (web--host-parser url)
   (let* ((name (string-append (web--parser-host url) ".xsl"))
-         (user (string-append (compos-home) "/packages/web/parsers/" name)))
-    ;; Learned parsers live in the user's compos directory, which is not
-    ;; necessarily on the Scheme library search path.
+         (user (string-append (web--parsers-dir) name)))
+    ;; Learned parsers live in the user's data, <compos-home>/web/parsers,
+    ;; which is not on the Scheme library search path.
     (cond ((file-exists? user) name)
           ((locate-library (string-append "web/parsers/" name)) name)
           (else #f))))

@@ -540,15 +540,15 @@ budget runs out at the bottom, where the furniture is not."
 (effects! '(write))
 
 (define (xslt--parsers-dir)
-  (let ((dir (string-append (compos-home) "/packages/web/parsers/")))
+  (let ((dir (web--parsers-dir)))
     (make-directory! dir)
     dir))
 
 (define (xslt--host url) (web--parser-host url))
 
-;; A learned sheet is the reader's, not the editor's: it lives under
-;; ~/.compos/packages/web/parsers, which is on the load path after the
-;; bundled parsers, so a stylesheet a person wrote still wins.
+;; A learned sheet is the reader's, not the editor's: it lives in the
+;; user's data, <compos-home>/web/parsers, and web--host-parser looks there
+;; before the bundled parsers.
 ;;
 ;; save SHEET as web/parsers/HOST.xsl. The file is the registration:
 ;; web--host-parser finds it by name, so the next visit reads the page
