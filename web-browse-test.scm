@@ -1119,3 +1119,92 @@
       (set! *web--arbiter* saved-arbiter)
       (set! web--read saved-read)
       (set! *web-fetch-html* saved-fetch))))
+
+
+;;; --- by the commands the keys run -----------------------------------------------
+;;; These were web_browse_test.exs: they pressed TAB, RET, s-RET and the
+;;; M-arrows; here they run browse-next-link, browse-follow,
+;;; browse-follow-new-tab, browse-back and browse-forward.
+
+(effects! '(write))
+
+(deftest 'a-rendered-relative-link-navigates-the-same-tab
+  "preview-follow-link! resolves against the page and loads it in this tab, at the top"
+  (lambda ()
+    (t--web-with-fetch
+      (lambda (url want k) (k (list want (t--web-pages url) #f)))
+      (lambda ()
+        (let ((buf (browse "https://site.test/index.html")))
+          (preview-follow-link! (active-window) "second.html")
+          (check-equal! (current-buffer) buf "the same tab")
+          (check-contains! (buffer-text buf) "# Second page" "holds the new page")
+          (check-equal! (buffer-local-value 'browse-url buf) "https://site.test/second.html" "the url")
+          (check-equal! (buffer-point buf) 0 "at the top"))))
+    (t--web-kill-tabs!)))
+
+(deftest 'a-new-tab-takes-the-link-and-the-page-stays-put
+  "browse-follow-new-tab opens the link in its own tab; the origin keeps its page"
+  (lambda ()
+    (t--web-with-fetch
+      (lambda (url want k) (k (list want (t--web-pages url) #f)))
+      (lambda ()
+        (let ((a (browse "https://site.test/index.html")))
+          (goto-char! 0)
+          (run-command "browse-next-link")
+          (run-command "browse-follow-new-tab")
+          (let ((b (web--buffer-for "https://site.test/second.html")))
+            (check-true! (and b (not (equal? a b))) "a tab of its own")
+            (check-contains! (buffer-text b) "Second page" "with the page"))
+          (check-contains! (buffer-text a) "Front page" "the origin keeps its page")
+          (check-equal! (buffer-local-value 'browse-url a) "https://site.test/index.html" "and its url"))))
+    (t--web-kill-tabs!)))
+
+(deftest 'back-and-forward-serve-the-session-copy-and-a-new-page-clears-the-future
+  "browse-back and browse-forward fetch nothing; browsing elsewhere drops forward"
+  (lambda ()
+    (let ((fetches 0))
+      (t--web-with-fetch
+        (lambda (url want k)
+          (set! fetches (+ fetches 1))
+          (k (list want (t--web-pages url) #f)))
+        (lambda ()
+          (let ((buf (browse "https://site.test/index.html")))
+            (goto-char! 0)
+            (run-command "browse-next-link")
+            (run-command "browse-follow")
+            (check-equal! (buffer-local-value 'browse-url buf) "https://site.test/second.html" "followed")
+            (check-equal! fetches 2 "two pages, two fetches")
+            (run-command "browse-back")
+            (check-contains! (buffer-text buf) "Front page" "back")
+            (run-command "browse-forward")
+            (check-contains! (buffer-text buf) "Second page" "forward")
+            (run-command "browse-back")
+            (check-equal! fetches 2 "back and forward refetch nothing")
+            (check-equal! (buffer-local-value 'browse-url buf) "https://site.test/index.html" "home again")
+            (browse "https://site.test/docs/intro.html")
+            (check-equal! (buffer-local-value 'browse-forward buf) '() "a new page clears the future")))))
+    (t--web-kill-tabs!)))
+
+(deftest 'the-browse-prompt-offers-the-visited-pages
+  "a page read joins the visited list, and the URL prompt has it as a row"
+  (lambda ()
+    (t--web-with-fetch
+      (lambda (url want k) (k (list want (t--web-pages url) #f)))
+      (lambda ()
+        (browse "https://site.test/index.html")
+        (check-true! (assoc "https://site.test/index.html" (web--visited)) "the page is visited")
+        (check-equal! (cadr (assoc "https://site.test/index.html" (web--visited))) "Front page" "with its title")
+        (run-command "browse")
+        (check-true! (minibuffer-active?) "the prompt is up")
+        (check-true! (minibuffer-pick! "https://site.test/index.html") "it offers the page")
+        (when (minibuffer-active?) (minibuffer-cancel!))))
+    (t--web-kill-tabs!)))
+
+(deftest 'substack-has-its-parser-and-the-separator-is-a-range
+  "the parser registry names substack.xsl; a separator line is one face range"
+  (lambda ()
+    (check-contains! (web--site-parser "https://substack.com/inbox") "substack.xsl" "substack has a parser")
+    (check-false! (web--site-parser "https://example.com") "another host has none")
+    (check-true! (web--date-link? (list 0 5 "/@alice/note/c-1")) "a note link is a date link")
+    (check-equal! (web--article-separator-ranges "a\nCOMPOS-ARTICLE-SEPARATOR\nb") '((2 26 "web-separator"))
+                  "the separator range")))

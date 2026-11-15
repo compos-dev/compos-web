@@ -23,6 +23,7 @@
 (require 'content-cache)
 (require 'tabulated-list)
 (require 'tools)
+(require 'writing)                      ; browse-mode reads the writing measure and font
 
 (domain! 'web)
 (effects! '(read external))
