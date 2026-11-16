@@ -2673,7 +2673,10 @@ the tabs. C-s searches to any link.")
 ;;; M-x browsers: the browser windows the compos extension sees, and
 ;;; their tabs. A row per window heads the rows of its tabs; moving the
 ;;; point shows the tab's page beside the list: its url, its window, the
-;;; compos frame or site chat it holds, and its visible text. The same
+;;; compos frame or site chat it holds, and its visible text. Windows are
+;;; grouped by the Chrome profile they belong to, each heading named by the
+;;; profile's signed-in email or the name set in the extension's options.
+;;; The same
 ;;; keys work on both: o brings the tab to the front, r reads it as text,
 ;;; k closes it, g asks the browser again.
 
@@ -2685,11 +2688,42 @@ the tabs. C-s searches to any link.")
 (define web--browsers-frames '())
 (define web--browsers-text '())
 
+(define (web--browsers-profile-ids)
+  "the ids of the connected Chrome profiles that said who they are"
+  (if (boundp 'browser-profiles)
+      (filter (lambda (id) (and (string? id) (not (equal? id ""))))
+              (map (lambda (p) (plist-get p 'id)) (browser-profiles)))
+      '()))
+
 (define (web--browsers-fetch! k)
+  "ask every browser profile for its tabs and the compos frames, keep both, then (K)"
+  ;; Each Chrome profile is its own connection, and each says which profile
+  ;; it is. Ask every one by its id; the bridge tags each tab with its
+  ;; profile. An extension too old to say falls back to guessing below.
+  (let ((ids (web--browsers-profile-ids)))
+    (if (null? ids)
+        (web--browsers-fetch-guess! k)
+        (let ((left (length ids)) (all '()))
+          (for-each
+            (lambda (id)
+              (chrome-call "tabs" (list 'profile id)
+                (lambda (reply)
+                  (set! all (append all (or (plist-get reply 'tabs) '())))
+                  (set! left (- left 1))
+                  (when (= left 0)
+                    (browser-frames
+                      (lambda (frames)
+                        (set! web--browsers-tabs all)
+                        (set! web--browsers-frames (if (list? frames) frames '()))
+                        (set! web--browsers-text '())
+                        (k)))))))
+            ids)))))
+
+(define (web--browsers-fetch-guess! k)
   "ask the browser for its tabs and the compos frames, keep both, then (K)"
-  ;; Each Chrome profile is its own connection. A call that names no window
-  ;; reaches the profile that spoke last; one that names the group's window
-  ;; reaches that window's profile. Ask both and keep each tab once.
+  ;; A call that names no window reaches the profile that spoke last; one
+  ;; that names the group's window reaches that window's profile. Ask both
+  ;; and keep each tab once.
   (let ((gw (chrome-group-window (buffer-group *browsers-buffer*))))
     (chrome-call "tabs" '()
       (lambda (reply)
@@ -2710,11 +2744,22 @@ the tabs. C-s searches to any link.")
                     (finish (append more some)))))))))))
 
 (define (web--browsers-windows)
-  "the browser window ids, in the order the tabs list them"
-  (let loop ((ts web--browsers-tabs) (acc '()))
-    (if (null? ts) (reverse acc)
-        (let ((w (plist-get (car ts) 'window)))
-          (loop (cdr ts) (if (member w acc) acc (cons w acc)))))))
+  "the browser window ids, grouped by profile, each in the order the tabs list them"
+  (let loop ((ts web--browsers-tabs) (acc '()) (profs '()))
+    (if (null? ts)
+        (let ((ws (reverse acc)))
+          (apply append
+                 (map (lambda (p) (filter (lambda (w) (equal? (web--browsers-profile-of w) p)) ws))
+                      (reverse profs))))
+        (let ((w (plist-get (car ts) 'window)) (p (plist-get (car ts) 'profile)))
+          (loop (cdr ts)
+                (if (member w acc) acc (cons w acc))
+                (if (member p profs) profs (cons p profs)))))))
+
+(define (web--browsers-profile-of w)
+  "the profile label of browser window W, or #f when the extension did not say"
+  (let ((t (find (lambda (t) (equal? (plist-get t 'window) w)) web--browsers-tabs)))
+    (and t (plist-get t 'profile))))
 
 (define (web--browsers-frame-of id)
   (let ((f (find (lambda (f) (equal? (plist-get f 'tab) id)) web--browsers-frames)))
@@ -2733,8 +2778,11 @@ the tabs. C-s searches to any link.")
                             tabs))
                  (compos (find (lambda (r) (plist-get r 'frame)) rows))
                  (mine (equal? w (chrome-group-window (buffer-group buf))))
-                 (head (list 'section #t 'id (string-append "w:" (format "~a" w)) 'window w
-                             'title (string-append label "  ·  " (number->string (length tabs)) " tabs"
+                 (prof (web--browsers-profile-of w))
+                 (head (list 'section #t 'id (string-append "w:" (format "~a" w)) 'window w 'profile prof
+                             'title (string-append label
+                                                   (if prof (string-append "  ·  " prof) "")
+                                                   "  ·  " (number->string (length tabs)) " tabs"
                                                    (if compos "  ·  compos" "")
                                                    (if mine "  ·  this group's browser" "")))))
             (loop (cdr ws) (+ i 1) (append acc (cons head rows))))))))
@@ -2796,7 +2844,10 @@ the tabs. C-s searches to any link.")
                                'tone (if frame "info" "good")))
                        "Title" n n)))
          (meta (component 'ui/meta
-                 (list 'segs (list (list "" (web--host url)) '("c-sep" "  ·  ") (list "c-dim" (plist-get row 'wlabel))))))
+                 (list 'segs (append (list (list "" (web--host url)) '("c-sep" "  ·  ") (list "c-dim" (plist-get row 'wlabel)))
+                                     (if (plist-get row 'profile)
+                                         (list '("c-sep" "  ·  ") (list "c-dim" (plist-get row 'profile)))
+                                         '())))))
          (actions (component 'ui/actions
                     (list 'actions (list (list "browsers-activate" "Bring to front" "o" "good")
                                          (list "browsers-read" "Read as text" "r")
@@ -2810,6 +2861,7 @@ the tabs. C-s searches to any link.")
                                                 (list 'pairs (filter pair?
                                                                (list (list "URL" url)
                                                                      (list "Window" (plist-get row 'wlabel))
+                                                                     (and (plist-get row 'profile) (list "Profile" (plist-get row 'profile)))
                                                                      (list "Tab id" (format "~a" id))
                                                                      (and frame (list "compos frame" frame))
                                                                      (and chat (list "Site chat" chat)))))))))
