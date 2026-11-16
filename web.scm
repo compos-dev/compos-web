@@ -2727,3 +2727,7 @@ the tabs. C-s searches to any link.")
 ;; fetch is its own MCP server in the hub, not part of compos: a chat holds it
 ;; through a preset (web), so a group can leave it out
 (tool-server! 'fetch 'fetch)
+
+;; xslt.scm learns the site parsers browse reads with. use-package loads
+;; only web.scm, so web loads it; it calls web's helpers, so it comes last.
+(require 'xslt)
