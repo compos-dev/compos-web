@@ -2670,6 +2670,311 @@ the tabs. C-s searches to any link.")
 ;;; purpose: a short page is still the page. Other content types take their
 ;;; mime reader, so JSON, text and PDF read too.
 
+;;; M-x browsers: the browser windows the compos extension sees, and
+;;; their tabs. A row per window heads the rows of its tabs; moving the
+;;; point shows the tab's page beside the list: its url, its window, the
+;;; compos frame or site chat it holds, and its visible text. The same
+;;; keys work on both: o brings the tab to the front, r reads it as text,
+;;; k closes it, g asks the browser again.
+
+(domain! 'web)
+(effects! '(read external))
+
+(define *browsers-buffer* "*browsers*")
+(define web--browsers-tabs '())
+(define web--browsers-frames '())
+(define web--browsers-text '())
+
+(define (web--browsers-fetch! k)
+  "ask the browser for its tabs and the compos frames, keep both, then (K)"
+  ;; Each Chrome profile is its own connection. A call that names no window
+  ;; reaches the profile that spoke last; one that names the group's window
+  ;; reaches that window's profile. Ask both and keep each tab once.
+  (let ((gw (chrome-group-window (buffer-group *browsers-buffer*))))
+    (chrome-call "tabs" '()
+      (lambda (reply)
+        (let ((some (or (plist-get reply 'tabs) '())))
+          (define (finish tabs)
+            (browser-frames
+              (lambda (frames)
+                (set! web--browsers-tabs (if (list? tabs) tabs '()))
+                (set! web--browsers-frames (if (list? frames) frames '()))
+                (set! web--browsers-text '())
+                (k))))
+          (if (or (not gw) (find (lambda (t) (equal? (plist-get t 'window) gw)) some))
+              (finish some)
+              (chrome-call "tabs" (list 'window gw)
+                (lambda (r2)
+                  (let ((more (filter (lambda (t) (not (find (lambda (s) (equal? (plist-get s 'id) (plist-get t 'id))) some)))
+                                      (or (plist-get r2 'tabs) '()))))
+                    (finish (append more some)))))))))))
+
+(define (web--browsers-windows)
+  "the browser window ids, in the order the tabs list them"
+  (let loop ((ts web--browsers-tabs) (acc '()))
+    (if (null? ts) (reverse acc)
+        (let ((w (plist-get (car ts) 'window)))
+          (loop (cdr ts) (if (member w acc) acc (cons w acc)))))))
+
+(define (web--browsers-frame-of id)
+  (let ((f (find (lambda (f) (equal? (plist-get f 'tab) id)) web--browsers-frames)))
+    (and f (plist-get f 'frame))))
+
+(define (web--browsers-rows buf)
+  (let ((chats (filter cdr (map (lambda (b) (cons (buffer-local-value 'browse-tab b) b)) (buffer-list)))))
+    (let loop ((ws (web--browsers-windows)) (i 1) (acc '()))
+      (if (null? ws) acc
+          (let* ((w (car ws))
+                 (tabs (filter (lambda (t) (equal? (plist-get t 'window) w)) web--browsers-tabs))
+                 (label (string-append "Window " (number->string i)))
+                 (rows (map (lambda (t)
+                              (let* ((id (plist-get t 'id)) (c (assoc id chats)))
+                                (append t (list 'wlabel label 'frame (web--browsers-frame-of id) 'chat (and c (cdr c))))))
+                            tabs))
+                 (compos (find (lambda (r) (plist-get r 'frame)) rows))
+                 (mine (equal? w (chrome-group-window (buffer-group buf))))
+                 (head (list 'section #t 'id (string-append "w:" (format "~a" w)) 'window w
+                             'title (string-append label "  ·  " (number->string (length tabs)) " tabs"
+                                                   (if compos "  ·  compos" "")
+                                                   (if mine "  ·  this group's browser" "")))))
+            (loop (cdr ws) (+ i 1) (append acc (cons head rows))))))))
+
+(define (web--browsers-marks row)
+  (string-join (filter (lambda (s) s)
+                       (list (and (plist-get row 'active) "front")
+                             (and (plist-get row 'frame) "compos")
+                             (and (plist-get row 'chat) "chat")))
+               " "))
+
+(define (web--browsers-title row)
+  (let ((t (plist-get row 'title))) (if (or (not t) (equal? t "")) "(untitled)" t)))
+
+(define (web--browsers-cells buf row)
+  (if (plist-get row 'section)
+      (list (list (plist-get row 'title) "list-section-name") "" "")
+      (list (web--browsers-title row)
+            (list (web--host (or (plist-get row 'url) "")) "dim")
+            (list (web--browsers-marks row) "dim"))))
+
+(define (web--browsers-narrow-cells buf row)
+  (if (plist-get row 'section)
+      (list (list (plist-get row 'title) "list-section-name") "")
+      (list (web--browsers-title row) (list (web--browsers-marks row) "dim"))))
+
+(define (web--browsers-list)
+  (if (equal? (buffer-local-value 'mode-name (current-buffer)) "browsers-mode")
+      (current-buffer)
+      (or (buffer-local-value 'browsers-list (current-buffer)) *browsers-buffer*)))
+
+(define (web--browsers-at)
+  "the tab at hand: the page's own, else the list's row"
+  (or (buffer-local-value 'browsers-tab (current-buffer))
+      (let ((r (list-current (web--browsers-list)))) (and r (not (plist-get r 'section)) r))))
+
+(define (web--browsers-window-at)
+  "the browser window at hand: the window row's own, else its tab's"
+  (or (let ((t (buffer-local-value 'browsers-tab (current-buffer)))) (and t (plist-get t 'window)))
+      (let ((r (list-current (web--browsers-list)))) (and r (plist-get r 'window)))))
+
+(define (web--browsers-detail-buffer row)
+  (string-append "*browser:" (format "~a" (plist-get row 'id)) "*"))
+
+(define (web--browsers-page row)
+  (let* ((lines '())
+         (line! (lambda (text) (set! lines (cons text lines)) (length lines)))
+         (stop (lambda (blk name first last) (append blk (list 'anchor-name name 'lines (list first last)))))
+         (id (plist-get row 'id))
+         (title (web--browsers-title row))
+         (url (or (plist-get row 'url) ""))
+         (frame (plist-get row 'frame))
+         (chat (plist-get row 'chat))
+         (text (assoc id web--browsers-text))
+         (head (let ((n (line! title)))
+                 (stop (component 'ui/title
+                         (list 'text title
+                               'badge (cond (frame "compos") ((plist-get row 'active) "front") (else ""))
+                               'tone (if frame "info" "good")))
+                       "Title" n n)))
+         (meta (component 'ui/meta
+                 (list 'segs (list (list "" (web--host url)) '("c-sep" "  ·  ") (list "c-dim" (plist-get row 'wlabel))))))
+         (actions (component 'ui/actions
+                    (list 'actions (list (list "browsers-activate" "Bring to front" "o" "good")
+                                         (list "browsers-read" "Read as text" "r")
+                                         (list "browsers-close" "Close tab" "k" "bad")
+                                         (list "browsers-use-window" "Use this window for the group" "d")
+                                         (list "browsers-refresh" "Refresh" "g")))))
+         (details (let ((n (line! "Details")))
+                    (stop (component 'ui/group
+                            (list 'title "Details"
+                                  'body (list (component 'ui/kv
+                                                (list 'pairs (filter pair?
+                                                               (list (list "URL" url)
+                                                                     (list "Window" (plist-get row 'wlabel))
+                                                                     (list "Tab id" (format "~a" id))
+                                                                     (and frame (list "compos frame" frame))
+                                                                     (and chat (list "Site chat" chat)))))))))
+                          "Details" n n)))
+         (body (let ((n (line! "Text")))
+                 (stop (component 'ui/group
+                         (list 'title "Text"
+                               'body (list (list 'tag "c-group" 'class "c-prose c-lines"
+                                                 'text (if text (cdr text) "reading…")))))
+                       "Text" n n))))
+    (list (string-join (reverse lines) "\n")
+          (list (component 'ui/page (list 'body (list head meta actions details body)))))))
+
+(define (web--browsers-draw! buf row)
+  (let ((page (web--browsers-page row)))
+    (buffer-set-local! buf 'browsers-tab row)
+    (buffer-set-read-only! buf #f)
+    (buffer-set-text! buf (car page) #t)
+    (buffer-set-local! buf 'render-mode "blocks")
+    (buffer-set-local! buf 'render-blocks (cadr page))
+    (anchor-set-blocks! buf (car page) (cadr page))
+    (unless (minor-mode-on? buf "anchor-mode") (enable-minor-mode! buf "anchor-mode"))
+    (anchor-sync! buf)
+    (buffer-set-local! buf 'footer-line-blocks
+      (list (component 'ui/keys-bar
+              (list 'main '(("o" "front") ("r" "read") ("k" "close") ("d" "group's browser") ("g" "refresh") ("q" "quit"))))))
+    (buffer-set-read-only! buf #t)))
+
+(define (web--browsers-read-text! row)
+  "read the tab's visible text once, then draw it on its page"
+  (let ((id (plist-get row 'id)))
+    (tab-read id
+      (lambda (r)
+        (let* ((t (or (and (pair? r) (plist-get r 'text)) ""))
+               (t (if (> (string-length t) 3000) (string-append (substring t 0 3000) "…") t)))
+          (set! web--browsers-text (cons (cons id (if (equal? (string-trim t) "") "No text." t)) web--browsers-text))
+          (let ((buf (web--browsers-detail-buffer row)))
+            (when (buffer-known? buf)
+              (web--browsers-draw! buf (buffer-local-value 'browsers-tab buf)))))))))
+
+(effects! '(write external display))
+
+(define (browsers-show-detail! row)
+  "(browsers-show-detail! ROW) -- show the page of tab ROW beside the list"
+  (when (and row (not (plist-get row 'section)))
+    (let ((list-buf (web--browsers-list))
+          (buf (web--browsers-detail-buffer row)))
+      (unless (buffer-known? buf)
+        (buffer-create buf)
+        (let ((g (buffer-group list-buf))) (when g (buffer-move-to-group! buf g)))
+        (with-current-buffer buf (lambda () (set-mode! "browsers-detail-mode")))
+        (desktop-skip! buf 'render-blocks)
+        (desktop-skip! buf 'footer-line-blocks))
+      (buffer-set-local! buf 'browsers-list list-buf)
+      (web--browsers-draw! buf row)
+      (unless (assoc (plist-get row 'id) web--browsers-text) (web--browsers-read-text! row))
+      (display-buffer-detail! buf list-buf))))
+
+(define (web--browsers-refresh! buf)
+  (message "Asking the browser for its tabs…")
+  (web--browsers-fetch!
+    (lambda ()
+      (when (buffer-known? buf) (list-refresh! buf))
+      (message (string-append (number->string (length (web--browsers-windows))) " windows, "
+                              (number->string (length web--browsers-tabs)) " tabs")))))
+
+(define-list-mode! "browsers-mode"
+  (list
+    'doc (string-append
+           "The browser windows the compos extension sees, each with its tabs. "
+           "A tab is marked front when it is its window's active tab, compos when it shows a compos frame, "
+           "and chat when a site chat was opened from it. Moving the point shows the tab's page beside the list. "
+           "RET or o brings the tab to the front, r reads it as text, k closes it, "
+           "d makes its window this group's browser, where the group's background tabs open (d again gives it back), / narrows the rows, "
+           "g asks the browser again, q quits.")
+    'buffer *browsers-buffer*
+    'transient #f
+    'plain #t
+    'rows web--browsers-rows
+    'key (lambda (buf row) (format "~a" (plist-get row 'id)))
+    'separator? (lambda (buf row) (plist-get row 'section))
+    'section? (lambda (buf row) (plist-get row 'section))
+    'section-label (lambda (buf row) (plist-get row 'title))
+    'markable? (lambda (buf row) #f)
+    'columns (lambda (buf) (list (list "tab" #f) (list "site" 28) (list "" 18)))
+    'cells web--browsers-cells
+    'layouts (list (list 'name 'narrow 'max-cols (lambda (buf) 80)
+                         'columns (lambda (buf) (list (list "tab" #f) (list "" 18)))
+                         'cells web--browsers-narrow-cells)
+                   (list 'name 'wide 'default #t))
+    'preview (lambda (buf row) (browsers-show-detail! row))
+    'title (lambda (buf) "Browsers")
+    'total (lambda (buf) (length web--browsers-tabs))
+    'noun "tab"
+    'footer (lambda (buf) '(("o" "front") ("r" "read") ("k" "close") ("d" "group's browser") ("/" "filter") ("g" "refresh") ("q" "quit")))
+    'keys '(("RET" "browsers-activate") ("o" "browsers-activate") ("r" "browsers-read")
+            ("k" "browsers-close") ("d" "browsers-use-window") ("g" "browsers-refresh") ("q" "quit-window"))))
+
+(define-mode "browsers-detail-mode" (lambda () (buffer-set-read-only! (current-buffer) #t)))
+(mode-keys! "browsers-detail-mode"
+  '(("o" "browsers-activate") ("r" "browsers-read") ("k" "browsers-close") ("d" "browsers-use-window") ("g" "browsers-refresh")))
+(mode-doc! "browsers-detail-mode"
+  "One browser tab: its url, its window, the compos frame or site chat it holds, and its visible text. o brings it to the front, r reads it as text, k closes it, g asks the browser again.")
+
+(define-command "browsers" "List the browser windows and their tabs"
+  (lambda ()
+    (if (not (browser-connected?))
+        (message "The compos Chrome extension is not connected")
+        (let ((buf (list-mode-show! "browsers-mode")))
+          (web--browsers-refresh! buf)
+          buf))))
+
+(define-command "browsers-activate" "Bring the tab at point to the front"
+  (lambda ()
+    (let ((row (web--browsers-at)))
+      (if row (tab-activate (plist-get row 'id)) (message "No tab here"))))
+  'modes '(browsers-mode browsers-detail-mode))
+
+(define-command "browsers-read" "Read the tab at point as text in another window"
+  (lambda ()
+    (let ((row (web--browsers-at)))
+      (if (and row (plist-get row 'url)) (browse-other-window (plist-get row 'url)) (message "No tab here"))))
+  'modes '(browsers-mode browsers-detail-mode))
+
+(define-command "browsers-close" "Close the tab at point"
+  (lambda ()
+    (let ((row (web--browsers-at)) (list-buf (web--browsers-list)))
+      (if (not row) (message "No tab here")
+          (y-or-n (string-append "Close " (web--browsers-title row) "? ")
+            (lambda ()
+              (let ((id (plist-get row 'id)))
+                (tab-close id)
+                (set! web--browsers-tabs (filter (lambda (t) (not (equal? (plist-get t 'id) id))) web--browsers-tabs))
+                (when (buffer-known? list-buf) (list-refresh! list-buf))
+                (message "Closed")))))))
+  'modes '(browsers-mode browsers-detail-mode))
+
+(define (browsers-use-window! group window)
+  "(browsers-use-window! GROUP WINDOW) -- GROUP works in browser WINDOW: its background tabs open there; #f gives it back to each frame's own window"
+  (group-setting-set! group 'browser-window window))
+
+(define-command "browsers-use-window" "Make the window at point this group's browser; again on it, give it back"
+  (lambda ()
+    (let* ((list-buf (web--browsers-list))
+           (g (buffer-group list-buf))
+           (w (web--browsers-window-at)))
+      (cond ((not g) (message "This list is in no group"))
+            ((not w) (message "No window here"))
+            ((equal? w (chrome-group-window g))
+             (browsers-use-window! g #f)
+             (list-refresh! list-buf)
+             (message (string-append (group-name g) " works in each frame's own window again")))
+            (else
+             (browsers-use-window! g w)
+             (list-refresh! list-buf)
+             (message (string-append (group-name g) " now works in this window"))))))
+  'modes '(browsers-mode browsers-detail-mode))
+
+(define-command "browsers-refresh" "Ask the browser for its windows and tabs again"
+  (lambda () (web--browsers-refresh! (web--browsers-list)))
+  'modes '(browsers-mode browsers-detail-mode))
+
+(public! 'browsers-show-detail!
+  "(browsers-show-detail! ROW) — show the page of browser tab ROW beside the M-x browsers list")
+
 (domain! 'web)
 (effects! '(read external))
 
