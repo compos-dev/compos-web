@@ -2673,10 +2673,7 @@ the tabs. C-s searches to any link.")
 ;;; M-x browsers: the browser windows the compos extension sees, and
 ;;; their tabs. A row per window heads the rows of its tabs; moving the
 ;;; point shows the tab's page beside the list: its url, its window, the
-;;; compos frame or site chat it holds, and its visible text. Windows are
-;;; grouped by the Chrome profile they belong to, each heading named by the
-;;; profile's signed-in email or the name set in the extension's options.
-;;; The same
+;;; compos frame or site chat it holds, and its visible text. The same
 ;;; keys work on both: o brings the tab to the front, r reads it as text,
 ;;; k closes it, g asks the browser again.
 
@@ -2688,104 +2685,192 @@ the tabs. C-s searches to any link.")
 (define web--browsers-frames '())
 (define web--browsers-text '())
 
-(define (web--browsers-profile-ids)
-  "the ids of the connected Chrome profiles that said who they are"
+(define (web--browsers-seen)
+  "the browser windows seen before, kept across restarts"
+  (let ((s (cache-get 'browsers "windows")))
+    (or (and s (let ((v (json-parse s))) (and (list? v) v))) '())))
+
+(define (web--browsers-profiles)
+  "the Chrome profiles the extension reports, each with an id; () on a bridge without them"
   (if (boundp 'browser-profiles)
-      (filter (lambda (id) (and (string? id) (not (equal? id ""))))
-              (map (lambda (p) (plist-get p 'id)) (browser-profiles)))
+      (filter (lambda (p) (and (pair? p) (plist-get p 'id))) (browser-profiles))
       '()))
 
-(define (web--browsers-fetch! k)
-  "ask every browser profile for its tabs and the compos frames, keep both, then (K)"
-  ;; Each Chrome profile is its own connection, and each says which profile
-  ;; it is. Ask every one by its id; the bridge tags each tab with its
-  ;; profile. An extension too old to say falls back to guessing below.
-  (let ((ids (web--browsers-profile-ids)))
-    (if (null? ids)
-        (web--browsers-fetch-guess! k)
-        (let ((left (length ids)) (all '()))
-          (for-each
-            (lambda (id)
-              (chrome-call "tabs" (list 'profile id)
-                (lambda (reply)
-                  (set! all (append all (or (plist-get reply 'tabs) '())))
-                  (set! left (- left 1))
-                  (when (= left 0)
-                    (browser-frames
-                      (lambda (frames)
-                        (set! web--browsers-tabs all)
-                        (set! web--browsers-frames (if (list? frames) frames '()))
-                        (set! web--browsers-text '())
-                        (k)))))))
-            ids)))))
+(define (web--browsers-fetch-profiles! profiles k)
+  ;; one ask per profile, by its id: each answers for all its windows, its
+  ;; tabs marked with the profile. A profile that does not answer within the
+  ;; deadline is left out
+  (let ((done #f) (tabs '()) (answered 0))
+    (define (finish!)
+      (unless done
+        (set! done #t)
+        (debounce-cancel! 'web--browsers-deadline)
+        (browser-frames
+          (lambda (fs)
+            (set! web--browsers-tabs tabs)
+            (set! web--browsers-frames (if (list? fs) fs '()))
+            (set! web--browsers-text '())
+            (k)))))
+    (debounce! 'web--browsers-deadline 4000 (lambda (_) (finish!)) #f)
+    (for-each
+      (lambda (p)
+        (chrome-call "tabs" (list 'profile (plist-get p 'id))
+          (lambda (r)
+            (let ((more (or (plist-get r 'tabs) '())))
+              (set! tabs (append tabs
+                                 (map (lambda (t) (if (plist-get t 'profile) t (append t (list 'profile (plist-get p 'label)))))
+                                      (filter (lambda (t) (not (find (lambda (s) (equal? (plist-get s 'id) (plist-get t 'id))) tabs))) more)))))
+            (set! answered (+ answered 1))
+            (when (= answered (length profiles)) (finish!)))))
+      profiles)))
 
-(define (web--browsers-fetch-guess! k)
-  "ask the browser for its tabs and the compos frames, keep both, then (K)"
-  ;; A call that names no window reaches the profile that spoke last; one
-  ;; that names the group's window reaches that window's profile. Ask both
-  ;; and keep each tab once.
-  (let ((gw (chrome-group-window (buffer-group *browsers-buffer*))))
-    (chrome-call "tabs" '()
-      (lambda (reply)
-        (let ((some (or (plist-get reply 'tabs) '())))
-          (define (finish tabs)
-            (browser-frames
-              (lambda (frames)
-                (set! web--browsers-tabs (if (list? tabs) tabs '()))
-                (set! web--browsers-frames (if (list? frames) frames '()))
-                (set! web--browsers-text '())
-                (k))))
-          (if (or (not gw) (find (lambda (t) (equal? (plist-get t 'window) gw)) some))
-              (finish some)
-              (chrome-call "tabs" (list 'window gw)
-                (lambda (r2)
-                  (let ((more (filter (lambda (t) (not (find (lambda (s) (equal? (plist-get s 'id) (plist-get t 'id))) some)))
-                                      (or (plist-get r2 'tabs) '()))))
-                    (finish (append more some)))))))))))
+(define (web--browsers-fetch! k)
+  "ask every connected profile for its tabs, keep them and the compos frames, then (K)"
+  (let ((profiles (web--browsers-profiles)))
+    (if (pair? profiles)
+        (web--browsers-fetch-profiles! profiles k)
+        (web--browsers-fetch-by-windows! k))))
+
+(define (web--browsers-fetch-by-windows! k)
+  "before the bridge reported profiles: reach each one through a window it holds"
+  ;; Each Chrome profile is its own connection, and a call that names no
+  ;; window reaches only the profile that spoke last. A call that names a
+  ;; window reaches that window's profile, so ask again by every window we
+  ;; know of: the group's, the ones a compos frame shows in, and the ones
+  ;; seen before. Each answer covers its whole profile; a profile that does
+  ;; not answer within the deadline is left out.
+  (let ((done #f) (tabs '()) (asked '()) (answered 0) (frames '()))
+    (define (merge! more)
+      (set! tabs (append tabs (filter (lambda (t) (not (find (lambda (s) (equal? (plist-get s 'id) (plist-get t 'id))) tabs)))
+                                      (if (list? more) more '())))))
+    (define (finish!)
+      (unless done
+        (set! done #t)
+        (debounce-cancel! 'web--browsers-deadline)
+        (let ((wins (web--browsers-windows-of tabs)))
+          ;; a window asked about that no profile answered for is gone
+          (cache-put! 'browsers "windows"
+            (json-encode (filter (lambda (w) (or (member w wins) (not (member w asked))))
+                                 (append wins (filter (lambda (w) (not (member w wins))) (web--browsers-seen)))))))
+        (set! web--browsers-tabs tabs)
+        (set! web--browsers-frames frames)
+        (set! web--browsers-text '())
+        (k)))
+    (browser-frames
+      (lambda (fs)
+        (set! frames (if (list? fs) fs '()))
+        (chrome-call "tabs" '()
+          (lambda (reply)
+            (merge! (plist-get reply 'tabs))
+            (let* ((have (web--browsers-windows-of tabs))
+                   (gw (chrome-group-window (buffer-group *browsers-buffer*)))
+                   (asks (let loop ((ws (append (if gw (list gw) '()) (map (lambda (f) (plist-get f 'window)) frames) (web--browsers-seen)))
+                                    (acc '()))
+                           (cond ((null? ws) (reverse acc))
+                                 ((or (not (number? (car ws))) (member (car ws) have) (member (car ws) acc)) (loop (cdr ws) acc))
+                                 (else (loop (cdr ws) (cons (car ws) acc)))))))
+              (set! asked asks)
+              (if (null? asks)
+                  (finish!)
+                  (begin
+                    (debounce! 'web--browsers-deadline 4000 (lambda (_) (finish!)) #f)
+                    (for-each
+                      (lambda (w)
+                        (chrome-call "tabs" (list 'window w)
+                          (lambda (r)
+                            (merge! (plist-get r 'tabs))
+                            (set! answered (+ answered 1))
+                            (when (= answered (length asks)) (finish!)))))
+                      asks))))))))))
+
+(define (web--browsers-windows-of tabs)
+  (let loop ((ts tabs) (acc '()))
+    (if (null? ts) (reverse acc)
+        (let ((w (plist-get (car ts) 'window)))
+          (loop (cdr ts) (if (member w acc) acc (cons w acc)))))))
 
 (define (web--browsers-windows)
-  "the browser window ids, grouped by profile, each in the order the tabs list them"
-  (let loop ((ts web--browsers-tabs) (acc '()) (profs '()))
-    (if (null? ts)
-        (let ((ws (reverse acc)))
-          (apply append
-                 (map (lambda (p) (filter (lambda (w) (equal? (web--browsers-profile-of w) p)) ws))
-                      (reverse profs))))
-        (let ((w (plist-get (car ts) 'window)) (p (plist-get (car ts) 'profile)))
-          (loop (cdr ts)
-                (if (member w acc) acc (cons w acc))
-                (if (member p profs) profs (cons p profs)))))))
-
-(define (web--browsers-profile-of w)
-  "the profile label of browser window W, or #f when the extension did not say"
-  (let ((t (find (lambda (t) (equal? (plist-get t 'window) w)) web--browsers-tabs)))
-    (and t (plist-get t 'profile))))
+  "the browser window ids, each profile's together, in the order the tabs list them"
+  (let* ((ws (let loop ((ts web--browsers-tabs) (acc '()))
+               (if (null? ts) (reverse acc)
+                   (let ((w (plist-get (car ts) 'window)))
+                     (loop (cdr ts) (if (member w acc) acc (cons w acc)))))))
+         (profile-of (lambda (w) (or (plist-get (find (lambda (t) (equal? (plist-get t 'window) w)) web--browsers-tabs) 'profile) "")))
+         (order (let loop ((ws ws) (acc '()))
+                  (if (null? ws) (reverse acc)
+                      (let ((p (profile-of (car ws)))) (loop (cdr ws) (if (member p acc) acc (cons p acc))))))))
+    (apply append (map (lambda (p) (filter (lambda (w) (equal? (profile-of w) p)) ws)) order))))
 
 (define (web--browsers-frame-of id)
   (let ((f (find (lambda (f) (equal? (plist-get f 'tab) id)) web--browsers-frames)))
     (and f (plist-get f 'frame))))
 
+(define (web--browsers-names)
+  "the names given to browser windows, as ((WINDOW NAME) ...), kept across restarts"
+  (let ((s (cache-get 'browsers "names")))
+    (or (and s (let ((v (json-parse s))) (and (list? v) v))) '())))
+
+(define (web--browsers-name-of w)
+  (let ((hit (assoc w (web--browsers-names)))) (and hit (cadr hit))))
+
 (define (web--browsers-rows buf)
-  (let ((chats (filter cdr (map (lambda (b) (cons (buffer-local-value 'browse-tab b) b)) (buffer-list)))))
+  ;; a tree: each window a parent row, its tabs under it, so TAB folds one
+  ;; window and S-TAB every window
+  (let ((chats (filter cdr (map (lambda (b) (cons (buffer-local-value 'browse-tab b) b)) (buffer-list))))
+        (on (web--browsers-on buf)))
     (let loop ((ws (web--browsers-windows)) (i 1) (acc '()))
       (if (null? ws) acc
           (let* ((w (car ws))
+                 (key (string-append "w:" (format "~a" w)))
                  (tabs (filter (lambda (t) (equal? (plist-get t 'window) w)) web--browsers-tabs))
-                 (label (string-append "Window " (number->string i)))
+                 (label (or (web--browsers-name-of w) (string-append "Window " (number->string i))))
                  (rows (map (lambda (t)
                               (let* ((id (plist-get t 'id)) (c (assoc id chats)))
-                                (append t (list 'wlabel label 'frame (web--browsers-frame-of id) 'chat (and c (cdr c))))))
+                                (append t (list 'parent key 'wlabel label 'frame (web--browsers-frame-of id) 'chat (and c (cdr c))))))
                             tabs))
                  (compos (find (lambda (r) (plist-get r 'frame)) rows))
-                 (mine (equal? w (chrome-group-window (buffer-group buf))))
-                 (prof (web--browsers-profile-of w))
-                 (head (list 'section #t 'id (string-append "w:" (format "~a" w)) 'window w 'profile prof
+                 (mine (web--browsers-group-window? buf w (find (lambda (x) x) (map (lambda (t) (plist-get t 'profile)) tabs))))
+                 (profile (find (lambda (x) x) (map (lambda (t) (plist-get t 'profile)) tabs)))
+                 (head (list 'section #t 'id key 'window w 'profile profile
                              'title (string-append label
-                                                   (if prof (string-append "  ·  " prof) "")
+                                                   (if profile (string-append "  ·  " profile) "")
                                                    "  ·  " (number->string (length tabs)) " tabs"
                                                    (if compos "  ·  compos" "")
-                                                   (if mine "  ·  this group's browser" "")))))
-            (loop (cdr ws) (+ i 1) (append acc (cons head rows))))))))
+                                                   (if mine "  ·  pinned" "")))))
+            ;; the profile tab at the top keeps its own windows; All keeps every one
+            (loop (cdr ws) (+ i 1)
+                  (if (or (equal? on "All") (equal? profile on)) (append acc (cons head rows)) acc)))))))
+
+(define (web--browsers-profile-names)
+  "the profiles the tabs come from, in their order"
+  (let loop ((ts web--browsers-tabs) (acc '()))
+    (if (null? ts) (reverse acc)
+        (let ((p (plist-get (car ts) 'profile)))
+          (loop (cdr ts) (if (or (not p) (member p acc)) acc (cons p acc)))))))
+
+(define (web--browsers-on buf)
+  "the profile tab the list shows: All, or a profile's email"
+  (let ((on (buffer-local-value 'browsers-profile buf)))
+    (if (and on (member on (web--browsers-profile-names))) on "All")))
+
+(define (web--browsers-head buf)
+  ;; the tabs across the top: All, then one per profile
+  (let ((names (web--browsers-profile-names)) (on (web--browsers-on buf)))
+    (if (null? names) '()
+        (list (component 'ui/tabs
+                (list 'tabs (map (lambda (n) (list (string-append "browsers-profile:" n) n (equal? n on)))
+                                 (cons "All" names))))))))
+
+(define (web--browsers-profile-id label)
+  "the id of the Chrome profile LABEL names, or #f"
+  (let ((p (find (lambda (p) (and (pair? p) (equal? (plist-get p 'label) label))) (web--browsers-profiles))))
+    (and p (plist-get p 'id))))
+
+(define (web--browsers-group-window? buf w profile)
+  "is window W, of PROFILE, in the profile BUF's group is pinned to"
+  (let* ((g (buffer-group buf))
+         (pid (and g (chrome-group-profile g))))
+    (and pid (equal? pid (and profile (web--browsers-profile-id profile))))))
 
 (define (web--browsers-marks row)
   (string-join (filter (lambda (s) s)
@@ -2796,6 +2881,11 @@ the tabs. C-s searches to any link.")
 
 (define (web--browsers-title row)
   (let ((t (plist-get row 'title))) (if (or (not t) (equal? t "")) "(untitled)" t)))
+
+(define (web--browsers-marks-width)
+  (let loop ((ts web--browsers-tabs) (m 0))
+    (if (null? ts) (+ m 1)
+        (loop (cdr ts) (max m (string-length (web--browsers-marks (car ts))))))))
 
 (define (web--browsers-cells buf row)
   (if (plist-get row 'section)
@@ -2808,6 +2898,46 @@ the tabs. C-s searches to any link.")
   (if (plist-get row 'section)
       (list (list (plist-get row 'title) "list-section-name") "")
       (list (web--browsers-title row) (list (web--browsers-marks row) "dim"))))
+
+(define (web--browsers-imenu buf)
+  ;; imenu of the list: one tab per Chrome profile, holding its windows by
+  ;; name and its tabs by title, each with a line to choose by. It opens on
+  ;; the profile of this group's browser
+  (let* ((gw (chrome-group-window (buffer-group buf)))
+         (kind (lambda (r) (or (plist-get r 'profile) "browser")))
+         (rows
+           (with-current-buffer buf
+             (lambda ()
+               (let loop ((os (list-offsets buf)) (es (list-entries buf)) (acc '()))
+                 (if (or (null? os) (null? es))
+                     (reverse acc)
+                     (let* ((r (car es))
+                            (line (line-number-at-pos (car os)))
+                            (row (if (plist-get r 'section)
+                                     (let ((parts (filter (lambda (s) (not (equal? s (plist-get r 'profile))))
+                                                          (string-split (plist-get r 'title) "  ·  "))))
+                                       (list line (kind r) (car parts) (string-join (cdr parts) " · ")))
+                                     (list line (kind r) (string-append "   " (web--browsers-title r))
+                                           (string-join (filter (lambda (s) (not (equal? s "")))
+                                                                (list (web--host (or (plist-get r 'url) ""))
+                                                                      (or (plist-get r 'wlabel) "")
+                                                                      (web--browsers-marks r)))
+                                                        " · ")))))
+                       (loop (cdr os) (cdr es) (cons row acc))))))))
+         (home (find (lambda (r) (and (plist-get r 'section) (equal? (plist-get r 'window) gw))) (list-entries buf))))
+    (buffer-set-local! buf 'imenu-tab (if home (kind home) (if (pair? rows) (cadr (car rows)) "browser")))
+    rows))
+
+(define (web--browsers-detail-imenu buf)
+  ;; imenu of a tab's page: its three parts, each with what it holds
+  (let* ((row (buffer-local-value 'browsers-tab buf))
+         (text (and row (assoc (plist-get row 'id) web--browsers-text)))
+         (one (lambda (s) (let ((t (string-join (filter (lambda (w) (not (equal? w ""))) (string-split (string-replace (or s "") "\n" " ") " ")) " ")))
+                            (if (> (string-length t) 90) (string-append (substring t 0 89) "…") t)))))
+    (if (not row) '()
+        (list (list 1 "part" (web--browsers-title row) (one (plist-get row 'url)))
+              (list 2 "part" "Details" (one (string-append (or (plist-get row 'wlabel) "") " · tab " (format "~a" (plist-get row 'id)))))
+              (list 3 "part" "Text" (one (if text (cdr text) "reading…")))))))
 
 (define (web--browsers-list)
   (if (equal? (buffer-local-value 'mode-name (current-buffer)) "browsers-mode")
@@ -2844,15 +2974,12 @@ the tabs. C-s searches to any link.")
                                'tone (if frame "info" "good")))
                        "Title" n n)))
          (meta (component 'ui/meta
-                 (list 'segs (append (list (list "" (web--host url)) '("c-sep" "  ·  ") (list "c-dim" (plist-get row 'wlabel)))
-                                     (if (plist-get row 'profile)
-                                         (list '("c-sep" "  ·  ") (list "c-dim" (plist-get row 'profile)))
-                                         '())))))
+                 (list 'segs (list (list "" (web--host url)) '("c-sep" "  ·  ") (list "c-dim" (plist-get row 'wlabel))))))
          (actions (component 'ui/actions
                     (list 'actions (list (list "browsers-activate" "Bring to front" "o" "good")
                                          (list "browsers-read" "Read as text" "r")
                                          (list "browsers-close" "Close tab" "k" "bad")
-                                         (list "browsers-use-window" "Use this window for the group" "d")
+                                         (list "browsers-pin-profile" "Pin the group to this profile" "d")
                                          (list "browsers-refresh" "Refresh" "g")))))
          (details (let ((n (line! "Details")))
                     (stop (component 'ui/group
@@ -2878,6 +3005,7 @@ the tabs. C-s searches to any link.")
 (define (web--browsers-draw! buf row)
   (let ((page (web--browsers-page row)))
     (buffer-set-local! buf 'browsers-tab row)
+    (buffer-set-local! buf 'imenu-index-function 'web--browsers-detail-imenu)
     (buffer-set-read-only! buf #f)
     (buffer-set-text! buf (car page) #t)
     (buffer-set-local! buf 'render-mode "blocks")
@@ -2887,7 +3015,7 @@ the tabs. C-s searches to any link.")
     (anchor-sync! buf)
     (buffer-set-local! buf 'footer-line-blocks
       (list (component 'ui/keys-bar
-              (list 'main '(("o" "front") ("r" "read") ("k" "close") ("d" "group's browser") ("g" "refresh") ("q" "quit"))))))
+              (list 'main '(("o" "front") ("r" "read") ("k" "close") ("d" "pin profile") ("g" "refresh") ("q" "quit"))))))
     (buffer-set-read-only! buf #t)))
 
 (define (web--browsers-read-text! row)
@@ -2935,34 +3063,40 @@ the tabs. C-s searches to any link.")
            "A tab is marked front when it is its window's active tab, compos when it shows a compos frame, "
            "and chat when a site chat was opened from it. Moving the point shows the tab's page beside the list. "
            "RET or o brings the tab to the front, r reads it as text, k closes it, "
-           "d makes its window this group's browser, where the group's background tabs open (d again gives it back), / narrows the rows, "
+           "d pins this group to the window's Chrome profile, where the group's background tabs open in any of its windows (d again unpins), / narrows the rows, "
+           "The tabs across the top are All and each Chrome profile; <left> and <right> step them. "
+           "TAB folds the window at point and S-TAB every window, R names the window, "
            "g asks the browser again, q quits.")
     'buffer *browsers-buffer*
     'transient #f
     'plain #t
     'rows web--browsers-rows
     'key (lambda (buf row) (format "~a" (plist-get row 'id)))
-    'separator? (lambda (buf row) (plist-get row 'section))
-    'section? (lambda (buf row) (plist-get row 'section))
-    'section-label (lambda (buf row) (plist-get row 'title))
+    'parent (lambda (buf row) (plist-get row 'parent))
+    'head-blocks web--browsers-head
     'markable? (lambda (buf row) #f)
-    'columns (lambda (buf) (list (list "tab" #f) (list "site" 28) (list "" 18)))
+    ;; the title takes the line; the site comes only when there is room, and
+    ;; the marks are as wide as the longest one
+    'columns (lambda (buf) (list (list "tab" #f) (list "site" 22) (list "" (web--browsers-marks-width))))
     'cells web--browsers-cells
-    'layouts (list (list 'name 'narrow 'max-cols (lambda (buf) 80)
-                         'columns (lambda (buf) (list (list "tab" #f) (list "" 18)))
+    'layouts (list (list 'name 'narrow 'max-cols (lambda (buf) 110)
+                         'columns (lambda (buf) (list (list "tab" #f) (list "" (web--browsers-marks-width))))
                          'cells web--browsers-narrow-cells)
                    (list 'name 'wide 'default #t))
     'preview (lambda (buf row) (browsers-show-detail! row))
     'title (lambda (buf) "Browsers")
     'total (lambda (buf) (length web--browsers-tabs))
     'noun "tab"
-    'footer (lambda (buf) '(("o" "front") ("r" "read") ("k" "close") ("d" "group's browser") ("/" "filter") ("g" "refresh") ("q" "quit")))
+    'footer (lambda (buf) '(("←→" "profile") ("o" "front") ("r" "read") ("k" "close") ("d" "pin profile") ("R" "name window") ("TAB" "fold") ("S-TAB" "fold all") ("/" "filter") ("g" "refresh") ("q" "quit")))
     'keys '(("RET" "browsers-activate") ("o" "browsers-activate") ("r" "browsers-read")
-            ("k" "browsers-close") ("d" "browsers-use-window") ("g" "browsers-refresh") ("q" "quit-window"))))
+            ("k" "browsers-close") ("d" "browsers-pin-profile") ("R" "browsers-rename-window")
+            ("TAB" "list-toggle-children") ("S-TAB" "list-toggle-all-children")
+            ("<right>" "browsers-profile-next") ("<left>" "browsers-profile-prev")
+            ("g" "browsers-refresh") ("q" "quit-window"))))
 
 (define-mode "browsers-detail-mode" (lambda () (buffer-set-read-only! (current-buffer) #t)))
 (mode-keys! "browsers-detail-mode"
-  '(("o" "browsers-activate") ("r" "browsers-read") ("k" "browsers-close") ("d" "browsers-use-window") ("g" "browsers-refresh")))
+  '(("o" "browsers-activate") ("r" "browsers-read") ("k" "browsers-close") ("d" "browsers-pin-profile") ("R" "browsers-rename-window") ("g" "browsers-refresh")))
 (mode-doc! "browsers-detail-mode"
   "One browser tab: its url, its window, the compos frame or site chat it holds, and its visible text. o brings it to the front, r reads it as text, k closes it, g asks the browser again.")
 
@@ -2971,6 +3105,7 @@ the tabs. C-s searches to any link.")
     (if (not (browser-connected?))
         (message "The compos Chrome extension is not connected")
         (let ((buf (list-mode-show! "browsers-mode")))
+          (buffer-set-local! buf 'imenu-index-function 'web--browsers-imenu)
           (web--browsers-refresh! buf)
           buf))))
 
@@ -2999,26 +3134,73 @@ the tabs. C-s searches to any link.")
                 (message "Closed")))))))
   'modes '(browsers-mode browsers-detail-mode))
 
-(define (browsers-use-window! group window)
-  "(browsers-use-window! GROUP WINDOW) -- GROUP works in browser WINDOW: its background tabs open there; #f gives it back to each frame's own window"
-  (group-setting-set! group 'browser-window window))
+(define (browsers-pin-profile! group profile)
+  "(browsers-pin-profile! GROUP PROFILE) -- pin GROUP to the Chrome profile PROFILE (an id): its background tabs open in any window of it; #f unpins"
+  (group-setting-set! group 'browser-profile profile)
+  (group-setting-set! group 'browser-window #f))
 
-(define-command "browsers-use-window" "Make the window at point this group's browser; again on it, give it back"
+(define-command "browsers-pin-profile" "Pin this group to the Chrome profile of the window at point; again on it, unpin"
   (lambda ()
     (let* ((list-buf (web--browsers-list))
            (g (buffer-group list-buf))
-           (w (web--browsers-window-at)))
+           (w (web--browsers-window-at))
+           (tab (find (lambda (t) (equal? (plist-get t 'window) w)) web--browsers-tabs))
+           (label (and tab (plist-get tab 'profile)))
+           (pid (and label (web--browsers-profile-id label))))
       (cond ((not g) (message "This list is in no group"))
-            ((not w) (message "No window here"))
-            ((equal? w (chrome-group-window g))
-             (browsers-use-window! g #f)
+            ((not pid) (message "This window's profile is not known: the extension has not reported it"))
+            ((equal? pid (chrome-group-profile g))
+             (browsers-pin-profile! g #f)
              (list-refresh! list-buf)
-             (message (string-append (group-name g) " works in each frame's own window again")))
+             (message (string-append (group-name g) " is not pinned to a profile")))
             (else
-             (browsers-use-window! g w)
+             (browsers-pin-profile! g pid)
              (list-refresh! list-buf)
-             (message (string-append (group-name g) " now works in this window"))))))
+             (message (string-append (group-name g) " pinned to " label))))))
   'modes '(browsers-mode browsers-detail-mode))
+
+(define-command "browsers-rename-window" "Name the browser window at point; an empty name gives it back its number"
+  (lambda ()
+    (let ((w (web--browsers-window-at)) (list-buf (web--browsers-list)))
+      (if (not w)
+          (message "No window here")
+          (minibuffer-read (string-append "Name for " (or (web--browsers-name-of w) "this window") ": ") '()
+            (lambda (name)
+              (let* ((name (string-trim (or name "")))
+                     (rest (filter (lambda (e) (not (equal? (car e) w))) (web--browsers-names))))
+                (cache-put! 'browsers "names"
+                  (json-encode (if (equal? name "") rest (cons (list w name) rest))))
+                (when (buffer-known? list-buf) (list-refresh! list-buf))
+                (message (if (equal? name "") "Window name cleared" (string-append "Window named " name)))))))))
+  'modes '(browsers-mode browsers-detail-mode))
+
+(define (web--browsers-show-profile! buf name)
+  (buffer-set-local! buf 'browsers-profile name)
+  (list-refresh! buf)
+  (list-goto-first-entry buf)
+  (message name))
+
+(define (web--browsers-profile-step! d)
+  (let* ((buf (web--browsers-list))
+         (tabs (cons "All" (web--browsers-profile-names)))
+         (n (length tabs))
+         (i (let loop ((ts tabs) (i 0)) (cond ((null? ts) 0) ((equal? (car ts) (web--browsers-on buf)) i) (else (loop (cdr ts) (+ i 1)))))))
+    (web--browsers-show-profile! buf (list-ref tabs (modulo (+ i d n) n)))))
+
+(define (web--browsers-click buf id)
+  ;; a click on a profile tab
+  (and (string? id) (string-prefix? "browsers-profile:" id)
+       (begin (web--browsers-show-profile! (web--browsers-list) (substring id 17 (string-length id))) #t)))
+
+(add-hook! 'block-click 'web--browsers-click)
+
+(define-command "browsers-profile-next" "Show the next Chrome profile's windows"
+  (lambda () (web--browsers-profile-step! 1))
+  'modes '(browsers-mode))
+
+(define-command "browsers-profile-prev" "Show the previous Chrome profile's windows"
+  (lambda () (web--browsers-profile-step! -1))
+  'modes '(browsers-mode))
 
 (define-command "browsers-refresh" "Ask the browser for its windows and tabs again"
   (lambda () (web--browsers-refresh! (web--browsers-list)))
