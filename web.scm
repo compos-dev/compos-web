@@ -2869,7 +2869,7 @@ the tabs. C-s searches to any link.")
           (let* ((w (car ws))
                  (key (string-append "w:" (format "~a" w)))
                  (tabs (filter (lambda (t) (equal? (plist-get t 'window) w)) web--browsers-tabs))
-                 (label (or (web--browsers-name-of w) (string-append "Window " (number->string i))))
+                 (label (or (web--browsers-name-of w) (number->string i)))
                  (rows (map (lambda (t)
                               (let* ((id (plist-get t 'id)) (c (assoc id chats)))
                                 (append t (list 'parent key 'wlabel label 'frame (web--browsers-frame-of id) 'chat (and c (cdr c))))))
@@ -3231,6 +3231,28 @@ the tabs. C-s searches to any link.")
              (list-refresh! list-buf)
              (message (string-append (group-name g) " pinned to " label))))))
   'modes '(browsers-mode browsers-detail-mode))
+
+(define web--group-browser-none "(none: any profile)")
+
+(define-command "group-set-browser" "Choose the Chrome profile this group's browser tabs open in, or none"
+  (lambda ()
+    (let ((g (or (buffer-group (current-buffer)) (frame-group)))
+          (profiles (browser-profiles)))
+      (cond ((not g) (message "This buffer is in no group"))
+            ((null? profiles) (message "No Chrome profile is connected"))
+            (else
+             (let* ((cur (chrome-group-profile g))
+                    (label (lambda (pr) (string-append (plist-get pr 'label)
+                                                       (if (equal? (plist-get pr 'id) cur) "  (current)" ""))))
+                    (rows (append (map label profiles) (list web--group-browser-none))))
+               (completing-read (string-append "Browser profile for " (group-name g) ": ") rows
+                 (lambda (choice)
+                   (let ((pr (find (lambda (pr) (equal? (label pr) choice)) profiles)))
+                     (cond (pr (browsers-pin-profile! g (plist-get pr 'id))
+                               (message (string-append (group-name g) " uses " (plist-get pr 'label))))
+                           (else (browsers-pin-profile! g #f)
+                                 (message (string-append (group-name g) " is not pinned to a profile"))))))
+                 'require-match #t)))))))
 
 (define-command "browsers-rename-window" "Name the browser window at point; an empty name gives it back its number"
   (lambda ()
