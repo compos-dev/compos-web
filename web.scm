@@ -3252,7 +3252,8 @@ the tabs. C-s searches to any link.")
                                (message (string-append (group-name g) " uses " (plist-get pr 'label))))
                            (else (browsers-pin-profile! g #f)
                                  (message (string-append (group-name g) " is not pinned to a profile"))))))
-                 'require-match #t)))))))
+                 'require-match #t))))))
+  'public #t)
 
 (define-command "browsers-rename-window" "Name the browser window at point; an empty name gives it back its number"
   (lambda ()
